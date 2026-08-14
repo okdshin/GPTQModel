@@ -141,7 +141,10 @@ class QQQProcessor(LoopProcessor):
 
             # gptq is mutable.
             q = self.tasks[name]  # noqa: F821
-            q.add_batch(inp[0].data, out.data)  # noqa: F821
+            # A forward retried after a recoverable OOM re-invokes this hook
+            # for the same calibration batch; dedupe so the retry doesn't
+            # double-count.
+            q.add_batch(inp[0].data, out.data, batch_index=self.current_batch_index())  # noqa: F821
         return tmp
 
     def process(

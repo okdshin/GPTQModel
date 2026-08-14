@@ -396,7 +396,10 @@ class GPTQProcessor(LoopProcessor):
                         sample_out = out_tensor[sample_index : sample_index + 1, sample_keep, :].contiguous()
                     else:
                         sample_out = out
-                    g.add_batch(sample_inp.data, sample_out.data, batch_index=batch_idx)  # noqa: F821
+                    # Per-sample-unique dedupe key: a bare batch_idx would make
+                    # every sample after the first look like a dedupe hit.
+                    sample_batch_index = batch_idx if batch_idx is None else (batch_idx, sample_index)
+                    g.add_batch(sample_inp.data, sample_out.data, batch_index=sample_batch_index)  # noqa: F821
             else:
                 g.add_batch(inp_tensor.data, out.data, batch_index=batch_idx)  # noqa: F821
             del inp, out

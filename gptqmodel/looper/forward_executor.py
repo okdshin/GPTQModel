@@ -23,7 +23,7 @@ from ..utils.looper_helpers import (
     select_forward_devices,
 )
 from ..utils.model import move_to, nested_move_to
-from ..utils.torch import torch_sync
+from ..utils.torch import empty_cache_for_device, is_accelerator_oom_error, torch_sync
 
 if TYPE_CHECKING:  # pragma: no cover - imports for typing only
     from logbar.progress import ProgressBar
@@ -306,10 +306,28 @@ class ForwardExecutor:
                     module_output = None
                     try:
                         with torch.no_grad():
-                            if is_lm_head_module:
-                                module_output = module(*layer_input)
-                            else:
-                                module_output = module(*layer_input, **additional_inputs)
+                            for oom_attempt in range(2):
+                                try:
+                                    if is_lm_head_module:
+                                        module_output = module(*layer_input)
+                                    else:
+                                        module_output = module(*layer_input, **additional_inputs)
+                                    break
+                                except (torch.OutOfMemoryError, RuntimeError) as exc:
+                                    # A transient VRAM spike can collide with state not
+                                    # yet released from the previous subset; retry once
+                                    # after flushing caches.
+                                    if not is_accelerator_oom_error(exc, exec_device):
+                                        raise
+                                    if oom_attempt > 0:
+                                        raise
+                                    self.log.warn(
+                                        "Forward: OOM on %s (layer %s); flushing caches and retrying once.",
+                                        exec_device,
+                                        layer_index,
+                                    )
+                                    torch_sync(device=exec_device)
+                                    empty_cache_for_device(exec_device)
                     except StopForward:
                         module_output = None
                     finally:

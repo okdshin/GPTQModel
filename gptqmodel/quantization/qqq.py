@@ -18,6 +18,7 @@ from ..quantization.config import FallbackStrategy, SmoothMSE
 from ..quantization.quantizer import HF_OPTIMUM
 from ..utils import setup_logger
 from ..utils.device import get_device
+from ..utils.torch import empty_cache_for_device, is_accelerator_oom_error
 from .fallback_smooth import mse_optimal_quant, smooth_block
 from .gptq import get_number_of_rows_and_cols
 from .npu_linalg import npu_inverse_cholesky_factor
@@ -248,6 +249,10 @@ class QQQ:
         self.H: Optional[torch.Tensor] = None
         self._device_hessian_partials: Dict[torch.device, torch.Tensor] = {}
         self._device_sample_counts: Dict[torch.device, int] = {}
+        # A forward retried after a recoverable OOM re-invokes add_batch for
+        # the same calibration batch; track seen batch indices so the retry
+        # doesn't double-count.
+        self._seen_batch_indices: set = set()
 
     @staticmethod
     def _validate_module(module):
@@ -421,58 +426,90 @@ class QQQ:
         self.H = None
         return Q, scale, zero, g_idx, duration, avg_loss, damp_percent, scale_extra, self.nsamples
 
-    def add_batch(self, inp, out):
-        if DEBUG:
-            self.inp1 = inp
-            self.out1 = out
-        if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
-        if isinstance(self.layer, nn.Linear) or isinstance(
-                self.layer, transformers.Conv1D
-        ):
-            if len(inp.shape) == 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
-        if isinstance(self.layer, nn.Conv2d):
-            unfold = nn.Unfold(
-                self.layer.kernel_size,
-                dilation=self.layer.dilation,
-                padding=self.layer.padding,
-                stride=self.layer.stride,
-            )
-            inp = unfold(inp)
-            inp = inp.permute([1, 0, 2])
-            inp = inp.flatten(1)
+    def add_batch(self, inp, out, batch_index: Optional[int] = None):
+        reserved_batch_index = False
+        if batch_index is not None:
+            with self.lock:
+                if batch_index in self._seen_batch_indices:
+                    log.warn(
+                        "QQQ module %r: skipping duplicate Hessian accumulation for "
+                        "batch %s (forward retried after a recoverable error?).",
+                        getattr(self, "name", "<unknown>"),
+                        batch_index,
+                    )
+                    return
+                self._seen_batch_indices.add(batch_index)
+                reserved_batch_index = True
 
-        dev = torch.device(get_device(inp))
-        batch_token_size = inp.shape[1]
-        inp = inp.float()
-        if self._tp_pad_cols:
-            pad = inp.new_zeros((self._tp_pad_cols, inp.shape[1]))
-            inp = torch.cat((inp, pad), dim=0)
-
-        with self.lock:
-            self.fwd_counter += 1
-            existing = self._device_hessian_partials.get(dev)
-            if existing is None:
-                existing = torch.zeros(
-                    (self.columns, self.columns),
-                    dtype=torch.float32,
-                    device=dev,
+        try:
+            if DEBUG:
+                self.inp1 = inp
+                self.out1 = out
+            if len(inp.shape) == 2:
+                inp = inp.unsqueeze(0)
+            if isinstance(self.layer, nn.Linear) or isinstance(
+                    self.layer, transformers.Conv1D
+            ):
+                if len(inp.shape) == 3:
+                    inp = inp.reshape((-1, inp.shape[-1]))
+                inp = inp.t()
+            if isinstance(self.layer, nn.Conv2d):
+                unfold = nn.Unfold(
+                    self.layer.kernel_size,
+                    dilation=self.layer.dilation,
+                    padding=self.layer.padding,
+                    stride=self.layer.stride,
                 )
-                self._device_hessian_partials[dev] = existing
+                inp = unfold(inp)
+                inp = inp.permute([1, 0, 2])
+                inp = inp.flatten(1)
 
-            # Accumulate xtx directly into the per-device buffer to avoid
-            # allocating a separate output tensor for every batch.
-            existing.addmm_(inp, inp.t(), beta=1.0, alpha=1.0)
-            self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + batch_token_size
-            self.nsamples += batch_token_size
+            dev = torch.device(get_device(inp))
+            batch_token_size = inp.shape[1]
+            inp = inp.float()
+            if self._tp_pad_cols:
+                pad = inp.new_zeros((self._tp_pad_cols, inp.shape[1]))
+                inp = torch.cat((inp, pad), dim=0)
+
+            with self.lock:
+                self.fwd_counter += 1
+                existing = self._device_hessian_partials.get(dev)
+                if existing is None:
+                    existing = torch.zeros(
+                        (self.columns, self.columns),
+                        dtype=torch.float32,
+                        device=dev,
+                    )
+                    self._device_hessian_partials[dev] = existing
+
+                # Accumulate xtx directly into the per-device buffer to avoid
+                # allocating a separate output tensor for every batch.
+                existing.addmm_(inp, inp.t(), beta=1.0, alpha=1.0)
+                self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + batch_token_size
+                self.nsamples += batch_token_size
+        except Exception:
+            if reserved_batch_index:
+                with self.lock:
+                    self._seen_batch_indices.discard(batch_index)
+            raise
 
     def materialize_hessian(self, target_device: Optional[torch.device] = None) -> torch.Tensor:
-        if target_device is None:
-            target_device = self.dev
-        target_device = torch.device(target_device)
+        device = torch.device(target_device) if target_device is not None else self.dev
+        try:
+            return self._materialize_hessian_on_device(device)
+        except RuntimeError as exc:
+            if not is_accelerator_oom_error(exc, device):
+                raise
+            log.warn(
+                "Quantization: Module `%s` -> %s OOM during Hessian finalization; falling back to CPU. "
+                "Due to this fallback, the calculation may take much longer than normal.",
+                self.name,
+                device.type.upper(),
+            )
+            empty_cache_for_device(device)
+            return self._materialize_hessian_on_device(torch.device("cpu"))
 
+    def _materialize_hessian_on_device(self, target_device: torch.device) -> torch.Tensor:
         total_samples = sum(self._device_sample_counts.values())
         if total_samples == 0:
             self.H = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=target_device)
@@ -480,16 +517,27 @@ class QQQ:
             return self.H
 
         # Merge per-device partials into a single Hessian on the target device.
-        # Pop and delete each partial as it is added so the peak memory stays
-        # at result + one partial instead of result + all partials.
+        # Pop each partial as it is added so the peak memory stays at result +
+        # one partial instead of result + all partials. If any merge step
+        # fails (e.g. OOM moving a partial cross-device), every partial
+        # popped so far this call is restored so the OOM-fallback retry on
+        # CPU still has the full set to work with -- a bare `except: raise`
+        # here would silently drop whatever had already been merged and
+        # popped, corrupting the Hessian instead of just being slow.
         result = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=target_device)
-        while self._device_hessian_partials:
-            dev, partial = self._device_hessian_partials.popitem()
-            if partial.device == target_device and partial.dtype == torch.float32:
-                result.add_(partial)
-            else:
-                result.add_(partial.to(device=target_device, dtype=torch.float32))
-            del partial
+        popped: Dict[torch.device, torch.Tensor] = {}
+        try:
+            while self._device_hessian_partials:
+                dev, partial = self._device_hessian_partials.popitem()
+                popped[dev] = partial
+                if partial.device == target_device and partial.dtype == torch.float32:
+                    result.add_(partial)
+                else:
+                    result.add_(partial.to(device=target_device, dtype=torch.float32))
+                del partial
+        except Exception:
+            self._device_hessian_partials.update(popped)
+            raise
 
         result.mul_(2.0 / float(total_samples))
         self.H = result
@@ -507,6 +555,8 @@ class QQQ:
 
         resolved_strategy = resolve_fallback_strategy(self.fallback)
 
+        result_device = self.layer.weight.data.device
+
         self.materialize_hessian()
 
         percdamp = self.qcfg.damp_percent
@@ -514,7 +564,12 @@ class QQQ:
         actorder = self.qcfg.desc_act
         static_groups = self.qcfg.static_groups
 
-        W = self.layer.weight.data.clone()
+        # materialize_hessian() may have fallen back to CPU on OOM, so the
+        # rest of this computation (dead-column masking, damping, the block
+        # loop) must run on self.H's device, not necessarily result_device --
+        # mixing a CPU H with a GPU-resident W clone below would otherwise
+        # raise a device-mismatch error right after the fallback "succeeded".
+        W = self.layer.weight.data.clone().to(device=self.H.device)
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
         if isinstance(self.layer, transformers.Conv1D):
@@ -721,7 +776,23 @@ class QQQ:
             scale = self._truncate_last_dim(scale, valid_cols)
             zero = self._truncate_last_dim(zero, valid_cols)
 
-        Q = Q.to(device=self.layer.weight.data.device, non_blocking=False)
+        try:
+            Q = Q.to(device=result_device, non_blocking=False)
+        except RuntimeError as exc:
+            if not is_accelerator_oom_error(exc, result_device):
+                raise
+            # The caller assigns this straight into module.weight.data, so a
+            # tensor left off result_device (rather than a retry) would
+            # corrupt a GPU-resident module.
+            log.warn(
+                "Quantization: Module `%s` -> %s OOM during quantize result move-to-device; "
+                "flushing cache and retrying the same device. Due to this retry, the "
+                "calculation may take much longer than normal.",
+                self.name,
+                result_device.type.upper(),
+            )
+            empty_cache_for_device(result_device)
+            Q = Q.to(device=result_device, non_blocking=False)
 
         # post int8 quant
         scale_extra = None

@@ -280,6 +280,25 @@ def _normalize_device(device: Union[torch.device, str, int, None]) -> Optional[t
     raise TypeError(f"Unsupported device specifier type: {type(device)}")
 
 
+_ACCELERATOR_OOM_MESSAGE_TOKENS = ("out of memory", "cublas_status_alloc_failed", "cusolver_status_alloc_failed")
+
+
+def is_accelerator_oom_error(exc: BaseException, device: Optional[torch.device] = None) -> bool:
+    """True if `exc` looks like an accelerator allocator OOM, optionally scoped to `device`.
+
+    Covers `torch.OutOfMemoryError` and the plain `RuntimeError` shape cuBLAS/cuSOLVER
+    allocation failures actually surface as.
+    """
+    if device is not None and device.type not in ("cuda", "xpu", "mps", "npu"):
+        return False
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    msg = str(exc).lower()
+    return any(token in msg for token in _ACCELERATOR_OOM_MESSAGE_TOKENS)
+
+
 @lru_cache(maxsize=12)
 def resolve_empty_cache_callable(device_type: str) -> Optional[Callable[[], None]]:
     try:

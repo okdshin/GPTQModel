@@ -60,6 +60,10 @@ class EoraProcessor(LoopProcessor):
         # contributions without repeatedly moving data through the CPU.
         self._segment_accumulators: Dict[str, Dict[torch.device, Dict[str, Any]]] = {}
         self._module_target_devices: Dict[str, torch.device] = {}
+        # A forward retried after a recoverable OOM re-invokes the hook for the
+        # same calibration batch; track seen batch indices per module so the
+        # retry doesn't double-count.
+        self._seen_batch_indices: Dict[str, set] = {}
 
         # Increase the dynamo cache size limit, default of 8 is too low
         if torch._dynamo.config.cache_size_limit < 64:
@@ -127,6 +131,7 @@ class EoraProcessor(LoopProcessor):
 
         self._module_target_devices[module.name] = torch.device(target_device)
         self._segment_accumulators[module.name] = {}
+        self._seen_batch_indices[module.name] = set()
 
         return
 
@@ -178,6 +183,12 @@ class EoraProcessor(LoopProcessor):
         scale_value = float(scale)
 
         with self.lock:
+            seen_batch_indices = None
+            if batch_index is not None:
+                seen_batch_indices = self._seen_batch_indices.setdefault(name, set())
+                if batch_index in seen_batch_indices:
+                    return
+
             accumulators = self._segment_accumulators.setdefault(name, {})
             record = accumulators.get(device)
 
@@ -192,16 +203,23 @@ class EoraProcessor(LoopProcessor):
                     "count": 1,
                 }
                 accumulators[device] = record
+                if seen_batch_indices is not None:
+                    seen_batch_indices.add(batch_index)
                 return
 
             total = record["total"]
             if total.device != contribution.device:
                 total = total.to(device=contribution.device)
 
-            total.mul_(scale_value)
-            total.add_(contribution)
+            # Merge into a fresh tensor rather than mutating `total` (and thus
+            # `record["total"]`) in place: a failure partway through (e.g. an
+            # OOM in add_) must not leave the shared accumulator scaled
+            # without the add, nor mark batch_index seen for a contribution
+            # that was never actually merged.
+            merged_total = total.mul(scale_value)
+            merged_total = merged_total.add_(contribution)
 
-            record["total"] = total
+            record["total"] = merged_total
             record["scale_product"] *= scale_value
             record["count"] += 1
 
@@ -211,6 +229,7 @@ class EoraProcessor(LoopProcessor):
                     record["start_index"] = batch_value
                 if record["end_index"] is None or batch_value > record["end_index"]:
                     record["end_index"] = batch_value
+                seen_batch_indices.add(batch_index)
             else:
                 if record.get("start_index") is None:
                     record["start_index"] = record["count"] - 1
@@ -224,6 +243,7 @@ class EoraProcessor(LoopProcessor):
         with self.lock:
             segments = self._segment_accumulators.pop(name, {})
             target_device = self._module_target_devices.pop(name, None)
+            self._seen_batch_indices.pop(name, None)
 
         if not segments:
             raise RuntimeError(
@@ -394,6 +414,7 @@ class EoraProcessor(LoopProcessor):
         """Releases accumulators and attaches the collected adapters to the model."""
 
         del self._segment_accumulators
+        del self._seen_batch_indices
         del self._module_target_devices
 
         # hack: store loras into model until `save()` is called

@@ -317,24 +317,60 @@ class ParoQuantProcessor(LoopProcessor):
                 self._layer_states[layer_index] = state
         return state
 
-    def _record_input_feature(self, module_name: str, feature: torch.Tensor) -> None:
+    def _record_input_feature(
+        self,
+        module_name: str,
+        feature: torch.Tensor,
+        *,
+        batch_index: Optional[int] = None,
+    ) -> None:
         """Store one batch of calibration activations for a named module."""
-        if feature.dim() <= 2:
-            feature = feature.unsqueeze(0)
+        # `batch_index` only gates retry-dedupe (opt-in, passed by the hook);
+        # bookkeeping always records the actual current batch so callers that
+        # don't pass it keep the pre-existing current_batch_index() behavior.
+        effective_batch_index = self.current_batch_index() if batch_index is None else batch_index
 
-        if feature.device.type != "cpu":
-            feature = feature.detach().cpu()
-        else:
-            feature = feature.detach()
+        reserved_batch_index = False
+        if batch_index is not None:
+            # A forward retried after a recoverable OOM re-invokes the hook for
+            # the same calibration batch; dedupe so the retry doesn't double-count.
+            with self.lock:
+                entry = self.tasks.get(module_name)
+                if entry is None:
+                    entry = {"inputs": []}
+                    self.tasks[module_name] = entry
+                seen_batch_indices = entry.setdefault("seen_batch_indices", set())
+                if batch_index in seen_batch_indices:
+                    return
+                seen_batch_indices.add(batch_index)
+                reserved_batch_index = True
 
-        with self.lock:
-            entry = self.tasks.get(module_name)
-            if entry is None:
-                entry = {"inputs": []}
-                self.tasks[module_name] = entry
-            batch_index = self.current_batch_index()
-            entry.setdefault("input_batch_indices", []).append(batch_index)
-            entry.setdefault("inputs", []).append(feature)
+        try:
+            if feature.dim() <= 2:
+                feature = feature.unsqueeze(0)
+
+            if feature.device.type != "cpu":
+                feature = feature.detach().cpu()
+            else:
+                feature = feature.detach()
+
+            with self.lock:
+                entry = self.tasks.get(module_name)
+                if entry is None:
+                    entry = {"inputs": []}
+                    self.tasks[module_name] = entry
+                entry.setdefault("input_batch_indices", []).append(effective_batch_index)
+                entry.setdefault("inputs", []).append(feature)
+        except Exception:
+            # A failure here (e.g. OOM moving `feature` to CPU) must not leave
+            # batch_index reserved -- a legitimate retry needs to actually
+            # capture this batch, not silently skip it as a duplicate forever.
+            if reserved_batch_index:
+                with self.lock:
+                    entry = self.tasks.get(module_name)
+                    if entry is not None:
+                        entry.get("seen_batch_indices", set()).discard(batch_index)
+            raise
 
     def _ensure_task_bucket(self, module_name: str, layer_index: int) -> None:
         """Reset repeated relative module names when quantization advances to a new layer."""
@@ -2475,7 +2511,7 @@ class ParoQuantProcessor(LoopProcessor):
             if not inp:
                 return
             feature = inp[0] if isinstance(inp, (tuple, list)) else inp
-            self._record_input_feature(name, feature)
+            self._record_input_feature(name, feature, batch_index=self.current_batch_index())
 
         return hook
 

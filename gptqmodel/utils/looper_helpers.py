@@ -22,7 +22,7 @@ from ..utils.inspect import get_supported_kwargs
 from ..utils.logger import setup_logger
 from ..utils.model import get_layer_name, move_to, nested_move_to
 from ..utils.safe import ThreadSafe
-from ..utils.torch import ALL_DEVICES, CPU, HAS_NPU, torch_sync
+from ..utils.torch import ALL_DEVICES, CPU, HAS_NPU, empty_cache_for_device, is_accelerator_oom_error, torch_sync
 
 
 USE_TORCH_REPLICATE = env_flag("GPTQMODEL_USE_TORCH_REPLICATE", True)
@@ -456,10 +456,30 @@ def forward_batch_worker(
     module_output = None
     kv_next = None
     try:
-        if is_lm_head_module:
-            module_output = module(*inputs)
-        else:
-            module_output = module(*inputs, **additional_inputs)
+        for oom_attempt in range(2):
+            try:
+                if is_lm_head_module:
+                    module_output = module(*inputs)
+                else:
+                    module_output = module(*inputs, **additional_inputs)
+                break
+            except (torch.OutOfMemoryError, RuntimeError) as exc:
+                # Mirrors ForwardExecutor.run_single's retry: a transient VRAM
+                # spike can collide with state not yet released from the
+                # previous subset. Hooks that already fired during this
+                # attempt rely on their own batch_index dedupe to avoid
+                # double-counting on the retry.
+                if not is_accelerator_oom_error(exc, module_device):
+                    raise
+                if oom_attempt > 0:
+                    raise
+                log.warn(
+                    "Forward: OOM on %s (batch %s); flushing caches and retrying once.",
+                    module_device,
+                    batch_index,
+                )
+                torch_sync(device=module_device)
+                empty_cache_for_device(module_device)
     except StopForward:
         module_output = None
     finally:

@@ -9,7 +9,7 @@ import contextlib
 import math
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Hashable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,7 +22,7 @@ from ..quantization.config import FallbackStrategy, SmoothMSE
 from ..utils.device import get_device
 from ..utils.env import env_flag
 from ..utils.logger import setup_logger
-from ..utils.torch import torch_sync
+from ..utils.torch import empty_cache_for_device, is_accelerator_oom_error, torch_sync
 from .fallback_smooth import mse_optimal_quant, smooth_block
 from .gar import (
     compose_final_perm,
@@ -260,6 +260,12 @@ class GPTQ:
         self.H: Optional[torch.Tensor] = None
         self._H_diag: Optional[torch.Tensor] = None
 
+        # Each calibration batch must contribute to the Hessian exactly once.
+        # A forward pass may be re-executed after a recoverable CUDA OOM, and
+        # hooks that fired before the OOM point would otherwise double-count
+        # their batch on the retry.
+        self._seen_batch_indices: set = set()
+
         # Store per-device Hessian contributions so multi-GPU calibration can
         # keep local accumulators and merge only once when quantization begins.
         self._device_hessian_partials: Dict[torch.device, torch.Tensor] = {}
@@ -324,14 +330,29 @@ class GPTQ:
         return identity, damp
 
     def log_cpu_fallback(self, stage: str, source_device: torch.device) -> None:
-        """Explain when a memory-heavy GPTQ step moves from CUDA to CPU."""
+        """Explain when a memory-heavy GPTQ step moves off an accelerator to CPU."""
 
         log.warn(
-            "Quantization: Module `%s` -> CUDA OOM during %s on %s; falling back to CPU. "
+            "Quantization: Module `%s` -> %s OOM during %s on %s; falling back to CPU. "
             "Due to this fallback, the calculation may take much longer than normal.",
             self.name,
+            source_device.type.upper(),
             stage,
             source_device,
+        )
+
+    def log_device_move_retry(self, stage: str, device: torch.device) -> None:
+        """Explain when a memory-heavy GPTQ step flushes the allocator cache and
+        retries the same (not CPU) device -- the caller needs the result to land
+        back on `device`, so there is no CPU fallback to fall back to here."""
+
+        log.warn(
+            "Quantization: Module `%s` -> OOM during %s on %s; flushing cache and "
+            "retrying the same device. Due to this retry, the calculation may take "
+            "much longer than normal.",
+            self.name,
+            stage,
+            device,
         )
 
     def clone_module(self, copy=True, device: torch.device = None):
@@ -370,45 +391,88 @@ class GPTQ:
 
         return tensor.narrow(tensor.dim() - 1, 0, trim).contiguous()
 
-    def add_batch(self, inp: torch.Tensor, out: torch.Tensor, batch_index: Optional[int] = None):
-        if isinstance(self.module, nn.Embedding):
-            del out, batch_index
-            token_count, counts, device = self.process_batch(inp)
-            if token_count == 0 or counts is None:
+    def add_batch(self, inp: torch.Tensor, out: torch.Tensor, batch_index: Optional[Hashable] = None):
+        # batch_index dedupes per contribution, not per forward call: a caller
+        # invoking this multiple times for one forward (e.g. per masked
+        # sample) must pass a per-contribution-unique key.
+        reserved_batch_index = False
+        if batch_index is not None:
+            with self.lock:
+                if batch_index in self._seen_batch_indices:
+                    log.warn(
+                        "GPTQ module %r: skipping duplicate Hessian accumulation for "
+                        "batch %s (forward retried after a recoverable error?).",
+                        getattr(self, "name", "<unknown>"),
+                        batch_index,
+                    )
+                    return
+                self._seen_batch_indices.add(batch_index)
+                reserved_batch_index = True
+
+        # A failure below (including one process_batch's own OOM fallback
+        # can't recover from) must not leave batch_index reserved -- that
+        # would make a legitimate retry silently skip this contribution
+        # forever instead of actually accumulating it.
+        try:
+            if isinstance(self.module, nn.Embedding):
+                del out
+                token_count, counts, device = self.process_batch(inp)
+                if token_count == 0 or counts is None:
+                    return
+
+                dev = torch.device(device)
+                with self.lock:
+                    self.fwd_counter += 1
+                    existing = self._device_embedding_counts.get(dev)
+                    if existing is None:
+                        self._device_embedding_counts[dev] = counts
+                    else:
+                        existing.add_(counts)
+                    self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + token_count
+                    self.nsamples += token_count
+                    self._hessian_dirty = True
+                return
+
+            batch_token_size, xtx, device = self.process_batch(inp)
+            if batch_token_size == 0 or xtx is None:
                 return
 
             dev = torch.device(device)
+
             with self.lock:
                 self.fwd_counter += 1
-                existing = self._device_embedding_counts.get(dev)
+
+                if dev.type == "cpu":
+                    # Drain any now-cold GPU partial into the CPU one rather than
+                    # holding VRAM until materialize_global_hessian.
+                    for stale_device in [d for d in self._device_hessian_partials if d.type != "cpu"]:
+                        stale_partial = self._device_hessian_partials.pop(stale_device)
+                        stale_count = self._device_sample_counts.pop(stale_device, 0)
+                        moved = stale_partial.to(device=dev, dtype=torch.float32)
+                        del stale_partial
+                        cpu_partial = self._device_hessian_partials.get(dev)
+                        if cpu_partial is None:
+                            self._device_hessian_partials[dev] = moved
+                        else:
+                            cpu_partial.add_(moved)
+                            del moved
+                        self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + stale_count
+
+                existing = self._device_hessian_partials.get(dev)
                 if existing is None:
-                    self._device_embedding_counts[dev] = counts
+                    self._device_hessian_partials[dev] = xtx
                 else:
-                    existing.add_(counts)
-                self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + token_count
-                self.nsamples += token_count
+                    existing.add_(xtx)
+                    del xtx
+
+                self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + batch_token_size
+                self.nsamples += batch_token_size
                 self._hessian_dirty = True
-            return
-
-        batch_token_size, xtx, device = self.process_batch(inp)
-        if batch_token_size == 0 or xtx is None:
-            return
-
-        dev = torch.device(device)
-
-        with self.lock:
-            self.fwd_counter += 1
-
-            existing = self._device_hessian_partials.get(dev)
-            if existing is None:
-                self._device_hessian_partials[dev] = xtx
-            else:
-                existing.add_(xtx)
-                del xtx
-
-            self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + batch_token_size
-            self.nsamples += batch_token_size
-            self._hessian_dirty = True
+        except Exception:
+            if reserved_batch_index:
+                with self.lock:
+                    self._seen_batch_indices.discard(batch_index)
+            raise
 
     def preferred_staging_dtype(self, input_dtype: torch.dtype, device: torch.device) -> torch.dtype:
         device = torch.device(device)
@@ -619,18 +683,14 @@ class GPTQ:
         try:
             xtx = self.compute_hessian_xtx(reshaped_inp).to(dtype=torch.float32)
         except RuntimeError as exc:
-            if (
-                torch.device(inp_device).type == "cuda"
-                and "out of memory" in str(exc).lower()
-            ):
+            if is_accelerator_oom_error(exc, torch.device(inp_device)):
                 log.warn(
                     "GPTQ module '%s' fell back to CPU Hessian accumulation due to GPU OOM during batch processing.",
                     getattr(self, "name", "<unknown>"),
                 )
                 reshaped_inp_cpu = reshaped_inp.to(device=torch.device("cpu"))
                 del reshaped_inp
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                empty_cache_for_device(torch.device(inp_device))
                 canonical_device = torch.device("cpu")
                 xtx = self.compute_hessian_xtx(reshaped_inp_cpu).to(dtype=torch.float32)
                 xtx = xtx.detach()
@@ -665,6 +725,17 @@ class GPTQ:
             return torch.device("cpu")
 
     def materialize_global_hessian(self, target_device: Optional[torch.device] = None) -> None:
+        try:
+            self._materialize_global_hessian_on_device(target_device)
+        except RuntimeError as exc:
+            device = self._select_hessian_target_device(target_device)
+            if not is_accelerator_oom_error(exc, device):
+                raise
+            self.log_cpu_fallback("Hessian finalization", device)
+            empty_cache_for_device(device)
+            self._materialize_global_hessian_on_device(torch.device("cpu"))
+
+    def _materialize_global_hessian_on_device(self, target_device: Optional[torch.device] = None) -> None:
         with self.lock:
             # Select the destination under the same lock as partial-state reads;
             # this closes the GIL=0 window between device selection and merge.
@@ -686,7 +757,13 @@ class GPTQ:
                     diag = torch.zeros(self.columns, dtype=torch.float32, device=device)
                     previous_samples = 0
                 else:
-                    diag = self._H_diag.to(device=device, dtype=torch.float32)
+                    # copy=True: `.to()` aliases the source tensor when device
+                    # and dtype already match, and the in-place mul_/add_
+                    # below would then corrupt `self._H_diag` itself before
+                    # we know the OOM-fallback attempt (if any) will succeed.
+                    # A later attempt must rescale the original, not an
+                    # already-rescaled value.
+                    diag = self._H_diag.to(device=device, dtype=torch.float32, copy=True)
 
                 if total_samples == 0:
                     diag.zero_()
@@ -847,7 +924,15 @@ class GPTQ:
 
         if target_device is None:
             target_device = self.H.device if self.H is not None else self.module.weight.device
-        W = self.clone_module(device=target_device)
+        try:
+            W = self.clone_module(device=target_device)
+        except RuntimeError as exc:
+            if is_accelerator_oom_error(exc, target_device):
+                self.log_cpu_fallback("fallback-quantize weight clone", target_device)
+                empty_cache_for_device(target_device)
+                W = self.clone_module(device=torch.device("cpu"))
+            else:
+                raise
         Q = torch.empty_like(W)
         scale_chunks = []
         zero_chunks = []
@@ -960,7 +1045,18 @@ class GPTQ:
         else:
             Q = Q.to(self.module.weight.dtype)
 
-        Q = Q.to(device=self.module.weight.data.device, non_blocking=False)
+        try:
+            Q = Q.to(device=self.module.weight.data.device, non_blocking=False)
+        except RuntimeError as exc:
+            weight_device = self.module.weight.data.device
+            if not is_accelerator_oom_error(exc, weight_device):
+                raise
+            self.log_device_move_retry("fallback quantize result move-to-device", weight_device)
+            empty_cache_for_device(weight_device)
+            # Retry the same move rather than leaving Q off weight_device: the
+            # caller assigns this result straight into module.weight.data and
+            # assumes it lands on the module's own device.
+            Q = Q.to(device=weight_device, non_blocking=False)
         mean_abs_err = (Q - self.module.weight.data).abs().mean().item()
         duration = time.time() - start_time
         avg_loss = f"fallback({strategy.value}): {mean_abs_err:.7f}"
@@ -1119,7 +1215,16 @@ class GPTQ:
         target_device = torch.device(target_device)
 
         diag = self.finalize_hessian(target_device=target_device)
-        original_weight = self.clone_module(device=target_device)
+        try:
+            original_weight = self.clone_module(device=target_device)
+        except RuntimeError as exc:
+            if not is_accelerator_oom_error(exc, target_device):
+                raise
+            self.log_cpu_fallback("embedding weight clone", target_device)
+            empty_cache_for_device(target_device)
+            target_device = torch.device("cpu")
+            diag = diag.to(device=target_device)
+            original_weight = self.clone_module(device=target_device)
         weight = original_weight
         inverse_permutation = None
         group_permutation = None
@@ -1191,7 +1296,18 @@ class GPTQ:
             g_idx = g_idx[:self._original_columns]
 
         quantized = quantized.t().reshape(self.module.weight.shape).to(self.module.weight.dtype)
-        quantized = quantized.to(device=self.module.weight.device, non_blocking=False)
+        result_device = self.module.weight.device
+        try:
+            quantized = quantized.to(device=result_device, non_blocking=False)
+        except RuntimeError as exc:
+            if not is_accelerator_oom_error(exc, result_device):
+                raise
+            # The caller assigns this straight into module.weight.data, so a
+            # CPU tensor here (rather than a retry) would corrupt a
+            # GPU-resident module.
+            self.log_device_move_retry("embedding quantize result move-to-device", result_device)
+            empty_cache_for_device(result_device)
+            quantized = quantized.to(device=result_device, non_blocking=False)
 
         self.H = None
         self._device_hessian_partials.clear()
@@ -1250,6 +1366,8 @@ class GPTQ:
                 self._device_sample_counts.clear()
                 self._hessian_dirty = False
 
+            # _fallback_quantize retries its own clone_module call on CPU if
+            # fallback_device OOMs, so no outer retry is needed here.
             return self._fallback_quantize(
                 resolved_strategy, blocksize, target_device=fallback_device
             )
@@ -1263,7 +1381,18 @@ class GPTQ:
 
         if self.module_copy is None:
             # log.info("copy W to cuda_1")
-            W = self.clone_module(device=self.H.device)
+            try:
+                W = self.clone_module(device=self.H.device)
+            except RuntimeError as exc:
+                source_device = self.H.device
+                if not is_accelerator_oom_error(exc, source_device):
+                    raise
+                self.log_cpu_fallback("weight clone", source_device)
+                cpu_fallback_used = True
+                cpu_device = torch.device("cpu")
+                self.H = self.H.to(device=cpu_device)
+                empty_cache_for_device(source_device)
+                W = self.clone_module(device=cpu_device)
         else:
             W = self.module_copy.to(device=self.H.device)
             del self.module_copy
@@ -1300,7 +1429,7 @@ class GPTQ:
                 W = W[:, perm]
                 self.H = self.H[perm][:, perm]
             except RuntimeError as exc:
-                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
+                if not is_accelerator_oom_error(exc, self.H.device):
                     raise
 
                 self.log_cpu_fallback("Hessian permutation", self.H.device)
@@ -1329,7 +1458,7 @@ class GPTQ:
                 W = W[:, final_perm]
                 self.H = self.H[final_perm][:, final_perm]
             except RuntimeError as exc:
-                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
+                if not is_accelerator_oom_error(exc, self.H.device):
                     raise
 
                 self.log_cpu_fallback("act-group Hessian permutation", self.H.device)
@@ -1344,7 +1473,7 @@ class GPTQ:
             try:
                 Hinv, damp = self.hessian_inverse(self.H)
             except RuntimeError as exc:
-                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
+                if not is_accelerator_oom_error(exc, self.H.device):
                     raise
 
                 # Full-attention blocks on very large models can exceed GPU memory during the
@@ -1512,7 +1641,17 @@ class GPTQ:
                 Q[:, i1:i2] = Q1
                 if Hinv is not None:
                     Losses[:, i1:i2] = Losses1 / 2
-                    W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+                    try:
+                        W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+                    except RuntimeError as exc:
+                        if is_accelerator_oom_error(exc, W.device):
+                            self.log_cpu_fallback("column-block error propagation", W.device)
+                            empty_cache_for_device(W.device)
+                            update = Err1.to("cpu").matmul(Hinv[i1:i2, i2:].to("cpu"))
+                            W[:, i2:] -= update.to(device=W.device)
+                            del update
+                        else:
+                            raise
 
                 del W1, Q1, Err1, Losses1
                 if Hinv is not None:
@@ -1608,7 +1747,17 @@ class GPTQ:
                 result_device,
             )
 
-        Q = Q.to(device=result_device, non_blocking=False)
+        try:
+            Q = Q.to(device=result_device, non_blocking=False)
+        except RuntimeError as exc:
+            if not is_accelerator_oom_error(exc, result_device):
+                raise
+            self.log_device_move_retry("quantize result move-to-device", result_device)
+            empty_cache_for_device(result_device)
+            # Retry the same move rather than leaving Q on CPU: the caller
+            # assigns this result straight into module.weight.data and
+            # assumes it lands back on the module's own device.
+            Q = Q.to(device=result_device, non_blocking=False)
 
         duration = time.time() - start
 

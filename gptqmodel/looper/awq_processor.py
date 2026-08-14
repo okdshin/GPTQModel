@@ -2328,7 +2328,9 @@ class AWQProcessor(LoopProcessor):
             feature = inp
             if isinstance(feature, (tuple, list)) and feature:
                 feature = feature[0]
-            self._record_input_feature(name, feature)
+            # A forward retried after a recoverable OOM re-invokes this hook for
+            # the same calibration batch; dedupe so the retry doesn't double-count.
+            self._record_input_feature(name, feature, dedupe_batch=True)
         return hook
 
     def process(

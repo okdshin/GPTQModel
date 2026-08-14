@@ -54,6 +54,10 @@ class NativeProcessor(LoopProcessor):
         )
 
         self.native_inp_caches = {}
+        # A forward retried after a recoverable OOM re-invokes the hook for
+        # the same calibration batch; track seen batch indices per module so
+        # the retry doesn't double-count.
+        self._seen_batch_indices: Dict[str, set] = {}
 
     def set_calibration_dataset(self, calibration_dataset):
         """Rejects dataset replacement because capture setup is fixed at construction."""
@@ -64,6 +68,7 @@ class NativeProcessor(LoopProcessor):
         """Allocates the per-module cache used by the forward hook."""
 
         self.native_inp_caches[module.name] = []
+        self._seen_batch_indices[module.name] = set()
 
     def is_skipped(self, module: NamedModule) -> bool:
         """Reports that native input capture currently runs for every eligible module."""
@@ -77,29 +82,48 @@ class NativeProcessor(LoopProcessor):
         def tmp(module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor):
             """Copies the module input to the configured GPTAQ staging device."""
 
-            # gptq is mutable.
-            inp = inp[0].detach()
+            batch_index = self.current_batch_index()
+            reserved_batch_index = False
+            if batch_index is not None:
+                # A forward retried after a recoverable OOM re-invokes this
+                # hook for the same calibration batch; dedupe so the retry
+                # doesn't double-count.
+                with self.lock:
+                    seen_batch_indices = self._seen_batch_indices.setdefault(name, set())
+                    if batch_index in seen_batch_indices:
+                        return
+                    seen_batch_indices.add(batch_index)
+                    reserved_batch_index = True
 
-            if self.qcfg.gptaq is not None:
-                gptaq_device = self.qcfg.gptaq.device
-            elif self.qcfg.foem is not None:
-                gptaq_device = self.qcfg.foem.device
-            else:
-                gptaq_device = "auto"
-            if gptaq_device == "auto":
-                target_device = DEVICE_1
-            elif gptaq_device == "cpu":
-                # slower but >= 4x vram memory reduction
-                target_device = CPU
-            elif isinstance(gptaq_device, str):
-                target_device = torch.device(gptaq_device)
-            elif isinstance(gptaq_device, torch.device):
-                target_device = gptaq_device
-            else:
-                target_device = DEVICE_1
+            try:
+                # gptq is mutable.
+                inp = inp[0].detach()
 
-            self.native_inp_caches[name] += [inp.to(device=target_device)]
-            del inp, out
+                if self.qcfg.gptaq is not None:
+                    gptaq_device = self.qcfg.gptaq.device
+                elif self.qcfg.foem is not None:
+                    gptaq_device = self.qcfg.foem.device
+                else:
+                    gptaq_device = "auto"
+                if gptaq_device == "auto":
+                    target_device = DEVICE_1
+                elif gptaq_device == "cpu":
+                    # slower but >= 4x vram memory reduction
+                    target_device = CPU
+                elif isinstance(gptaq_device, str):
+                    target_device = torch.device(gptaq_device)
+                elif isinstance(gptaq_device, torch.device):
+                    target_device = gptaq_device
+                else:
+                    target_device = DEVICE_1
+
+                self.native_inp_caches[name] += [inp.to(device=target_device)]
+                del inp, out
+            except Exception:
+                if reserved_batch_index:
+                    with self.lock:
+                        self._seen_batch_indices.get(name, set()).discard(batch_index)
+                raise
 
         return tmp
 
@@ -125,6 +149,7 @@ class NativeProcessor(LoopProcessor):
         """Releases processor-level caches once the full loop has completed."""
 
         del self.native_inp_caches
+        del self._seen_batch_indices
 
     def verify_calibration_dataset(self, processor_index: int) -> bool:
         """Ensures a calibration dataset was provided before running capture."""
