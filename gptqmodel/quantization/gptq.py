@@ -56,8 +56,8 @@ _WORKSPACE_LOCKS_GUARD = threading.Lock()
 # tensors during Hessian accumulation. Each device retains at most a single
 # workspace; when size or dtype requirements change, the prior buffer is
 # discarded to avoid unbounded cache growth.
-_WORKSPACE_CACHE: Dict[Tuple[str, Optional[int]], torch.Tensor] = {}
-_WORKSPACE_LOCKS: Dict[Tuple[str, Optional[int]], threading.Lock] = {}
+_WORKSPACE_CACHE: Dict[Tuple[str, Optional[int], str, int], torch.Tensor] = {}
+_WORKSPACE_LOCKS: Dict[Tuple[str, Optional[int], str, int], threading.Lock] = {}
 _BF16_SUPPORT_CACHE: Dict[Tuple[str, Optional[int]], bool] = {}
 
 
@@ -66,8 +66,11 @@ def _device_cache_key(device: torch.device) -> Tuple[str, Optional[int]]:
     return dev.type, dev.index
 
 
-def _workspace_cache_key(device: torch.device) -> Tuple[str, Optional[int]]:
-    return _device_cache_key(device)
+def _workspace_cache_key(
+    device: torch.device, dtype: torch.dtype, cols: int
+) -> Tuple[str, Optional[int], str, int]:
+    dev_type, dev_index = _device_cache_key(device)
+    return dev_type, dev_index, str(dtype), int(cols)
 
 
 def _workspace_lock(key: Tuple[str, Optional[int]]) -> threading.Lock:
@@ -109,7 +112,7 @@ def _lease_workspace(
     cols: int,
     required_rows: int,
 ) -> Tuple[torch.Tensor, bool]:
-    key = _workspace_cache_key(device)
+    key = _workspace_cache_key(device, dtype, cols)
     lock = _workspace_lock(key)
     with lock:
         workspace = _WORKSPACE_CACHE.pop(key, None)
