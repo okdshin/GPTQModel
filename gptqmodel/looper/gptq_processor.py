@@ -202,6 +202,10 @@ class GPTQProcessor(LoopProcessor):
             inp_tensor = inp[0]
             keep_mask = getattr(getattr(self, "_mask_tls", None), "value", None)
 
+            # pooled worker thread may have last set keep_mask for a different device
+            if torch.is_tensor(keep_mask) and torch.is_tensor(inp_tensor) and keep_mask.device != inp_tensor.device:
+                keep_mask = keep_mask.to(device=inp_tensor.device)
+
             if (
                 torch.is_tensor(inp_tensor)
                 and torch.is_tensor(keep_mask)
