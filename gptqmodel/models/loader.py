@@ -659,9 +659,18 @@ def ModelLoader(cls):
             device: Optional[Union[str, int]] = None,
             **model_init_kwargs,
     ):
-        # quantization is unsafe with GIL=0 and torch.compile/graphs
+        # Quantization is unsafe with GIL=0 and torch.compile/dynamo: concurrent
+        # free-threading workers entering the dynamo eval-frame shim from
+        # different forward contexts (e.g. quant-time MoE routing overrides vs.
+        # a plain replay forward) can livelock, or worse, silently reuse a
+        # graph compiled under the wrong context -- observed in production as
+        # MoE routing bypass silently not applying after a resumed run replay
+        # forward, causing most expert Hessians to see zero samples and fall
+        # back to RTN. torch._dynamo.disable() called bare (no fn) only
+        # returns a DisableContext for use as a decorator/context manager --
+        # it does nothing on its own, so this used to be a no-op.
         import torch._dynamo
-        torch._dynamo.disable()
+        torch._dynamo.config.disable = True
 
         pretrained_model_id_or_path = normalize_model_id_or_path_for_hf_gguf(
             pretrained_model_id_or_path,
