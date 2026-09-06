@@ -17,7 +17,7 @@ import torch.nn as nn
 from models.model_test import ModelTest
 
 from gptqmodel.quantization import gptq as gptq_mod
-from gptqmodel.quantization.config import HessianConfig, QuantizeConfig
+from gptqmodel.quantization.config import FallbackStrategy, HessianConfig, QuantizeConfig
 from gptqmodel.quantization.gptq import GPTQ
 from gptqmodel.quantization.quantizer import Quantizer
 
@@ -132,6 +132,280 @@ def test_gptq_cpu_hessian_fallback_returns_quantized_weights_to_original_cuda_de
     assert "falling back to CPU" in joined_logs
     assert "may take much longer than normal" in joined_logs
     assert "moving final quantized weights back" in joined_logs
+
+
+def test_gptq_log_cpu_fallback_names_the_source_accelerator_type(monkeypatch):
+    """is_accelerator_oom_error() covers cuda/xpu/mps/npu, so the fallback
+    log must name the actual accelerator instead of always saying CUDA.
+    """
+    layer = nn.Linear(4, 4, bias=False, dtype=torch.float32).eval()
+    gptq = GPTQ(layer)
+
+    messages = []
+    monkeypatch.setattr(
+        gptq_mod.log,
+        "warn",
+        lambda message, *args, **kwargs: messages.append(message % args if args else message),
+    )
+
+    gptq.log_cpu_fallback("some stage", torch.device("xpu", 0))
+
+    assert any("XPU OOM" in m for m in messages)
+    assert not any("CUDA OOM" in m for m in messages)
+
+
+def test_gptq_add_batch_skips_duplicate_batch_index(monkeypatch):
+    device = torch.device("cpu")
+    layer = _make_module(hidden_dim=4, device=device)
+    gptq = GPTQ(layer)
+
+    inp = _generate_input(batch_size=1, seq_len=3, hidden_dim=4, device=device)
+
+    log_messages = []
+    monkeypatch.setattr(
+        gptq_mod.log,
+        "warn",
+        lambda message, *args, **kwargs: log_messages.append(message % args if args else message),
+    )
+
+    gptq.add_batch(inp, None, batch_index=0)
+    nsamples_after_first = gptq.nsamples
+
+    # Simulates a forward retried after a recoverable error re-invoking the
+    # same hook with the same batch_index: must not double-count.
+    gptq.add_batch(inp, None, batch_index=0)
+
+    assert gptq.nsamples == nsamples_after_first
+    assert any("skipping duplicate Hessian accumulation" in m for m in log_messages)
+
+    gptq.add_batch(inp, None, batch_index=1)
+    assert gptq.nsamples == nsamples_after_first * 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CPU fallback regression coverage")
+def test_gptq_materialize_global_hessian_falls_back_to_cpu_on_oom(monkeypatch):
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+
+    layer = _make_module(hidden_dim=8, device=device)
+    gptq = GPTQ(layer)
+
+    inp = _generate_input(batch_size=1, seq_len=4, hidden_dim=8, device=device)
+    gptq.add_batch(inp, None)
+
+    original_impl = GPTQ._materialize_global_hessian_on_device
+    calls = []
+
+    def _patched(self, target_device=None):
+        calls.append(target_device)
+        if len(calls) == 1:
+            raise RuntimeError("CUDA out of memory. simulated for regression test")
+        return original_impl(self, target_device)
+
+    monkeypatch.setattr(GPTQ, "_materialize_global_hessian_on_device", _patched)
+
+    log_messages = []
+    monkeypatch.setattr(
+        gptq_mod.log,
+        "warn",
+        lambda message, *args, **kwargs: log_messages.append(message % args if args else message),
+    )
+
+    gptq.materialize_global_hessian()
+
+    assert len(calls) == 2
+    assert calls[1] == torch.device("cpu")
+    assert gptq.H.device == torch.device("cpu")
+    joined_logs = "\n".join(log_messages)
+    assert "falling back to CPU" in joined_logs
+    assert "may take much longer than normal" in joined_logs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CPU fallback regression coverage")
+def test_gptq_embedding_materialize_hessian_oom_retry_matches_clean_run(monkeypatch):
+    """Re-scaling an existing _H_diag in place before the OOM-fallback retry
+    is known to succeed would corrupt it (the retry rescales an already-
+    scaled value). The retried result must match a clean, uninterrupted run.
+    """
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+
+    def _build_and_add_two_batches(seed):
+        torch.manual_seed(seed)
+        embedding = nn.Embedding(6, 3, dtype=torch.float32).to(device).eval()
+        gptq = GPTQ(embedding)
+        tokens1 = torch.randint(0, 6, (1, 4), device=device)
+        gptq.add_batch(tokens1, None)
+        gptq.materialize_global_hessian()
+        tokens2 = torch.randint(0, 6, (1, 4), device=device)
+        gptq.add_batch(tokens2, None)
+        return gptq
+
+    reference = _build_and_add_two_batches(seed=0)
+    reference.materialize_global_hessian()
+    reference_diag = reference._H_diag.clone()
+
+    flaky = _build_and_add_two_batches(seed=0)
+
+    original_add_ = torch.Tensor.add_
+    state = {"failed": False}
+
+    def _patched_add_(self, *args, **kwargs):
+        # Target only `diag.add_(counts.to(...), alpha=...)`, which runs
+        # after `diag.mul_()` has already (would have) scaled `diag` down --
+        # the exact corruption window this test guards.
+        if not state["failed"] and "alpha" in kwargs:
+            state["failed"] = True
+            raise RuntimeError("CUDA out of memory. simulated for regression test")
+        return original_add_(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "add_", _patched_add_)
+
+    flaky.materialize_global_hessian()
+
+    assert state["failed"]
+    assert flaky._H_diag.device == torch.device("cpu")
+    assert torch.allclose(flaky._H_diag, reference_diag.to("cpu"), atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CPU fallback regression coverage")
+def test_gptq_fallback_quantize_clone_module_oom_falls_back_to_cpu(monkeypatch):
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+
+    layer = _make_module(hidden_dim=8, device=device)
+    qcfg = QuantizeConfig(bits=4, group_size=4)
+    gptq = GPTQ(layer, qcfg=qcfg)
+    gptq.quantizer.configure(perchannel=True)
+
+    original_clone = GPTQ.clone_module
+    calls = []
+
+    def _patched_clone(self, copy=True, device=None):
+        resolved = torch.device(device) if device is not None else self.module.weight.data.device
+        calls.append(resolved)
+        if resolved.type == "cuda":
+            raise RuntimeError("CUDA out of memory. simulated for regression test")
+        return original_clone(self, copy=copy, device=device)
+
+    monkeypatch.setattr(GPTQ, "clone_module", _patched_clone)
+
+    log_messages = []
+    monkeypatch.setattr(
+        gptq_mod.log,
+        "warn",
+        lambda message, *args, **kwargs: log_messages.append(message % args if args else message),
+    )
+
+    Q, *_ = gptq._fallback_quantize(FallbackStrategy.RTN, blocksize=4, target_device=device)
+
+    assert calls[0].type == "cuda"
+    assert calls[1] == torch.device("cpu")
+    assert Q.device == device
+    joined_logs = "\n".join(log_messages)
+    assert "falling back to CPU" in joined_logs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CPU fallback regression coverage")
+def test_gptq_fallback_quantize_result_move_retries_and_lands_on_original_device(monkeypatch):
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+
+    layer = _make_module(hidden_dim=8, device=device)
+    qcfg = QuantizeConfig(bits=4, group_size=4)
+    gptq = GPTQ(layer, qcfg=qcfg)
+    gptq.quantizer.configure(perchannel=True)
+
+    calls = _patch_final_move_to_oom(monkeypatch, device, fail_times=1)
+
+    log_messages = []
+    monkeypatch.setattr(
+        gptq_mod.log,
+        "warn",
+        lambda message, *args, **kwargs: log_messages.append(message % args if args else message),
+    )
+
+    Q, *_ = gptq._fallback_quantize(FallbackStrategy.RTN, blocksize=4, target_device=device)
+
+    assert calls["count"] == 1
+    # The caller assigns this straight into module.weight.data, so a CPU
+    # tensor here (rather than a retry) would corrupt a GPU-resident module.
+    assert Q.device == device
+    joined_logs = "\n".join(log_messages)
+    assert "retrying the same device" in joined_logs
+
+
+def _make_quantize_final_move_gptq(device):
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+
+    layer = _make_module(hidden_dim=8, device=device)
+    qcfg = QuantizeConfig(bits=4, group_size=4, act_group_aware=False, mock_quantization=True)
+    gptq = GPTQ(layer, qcfg=qcfg)
+    gptq.quantizer.configure(perchannel=True)
+
+    inp = _generate_input(batch_size=1, seq_len=4, hidden_dim=8, device=device)
+    gptq.add_batch(inp, None)
+    return gptq
+
+
+def _patch_final_move_to_oom(monkeypatch, device, *, fail_times):
+    """Fails the final `Q.to(device=result_device, non_blocking=...)` call up to
+    `fail_times` times, then lets it (and anything else) through unchanged."""
+
+    original_to = torch.Tensor.to
+    calls = {"count": 0}
+
+    def _patched_to(self, *args, **kwargs):
+        if (
+            calls["count"] < fail_times
+            and "non_blocking" in kwargs
+            and kwargs.get("device") == device
+        ):
+            calls["count"] += 1
+            raise RuntimeError("CUDA out of memory. simulated for regression test")
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", _patched_to)
+    return calls
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CPU fallback regression coverage")
+def test_gptq_quantize_final_result_move_retries_and_lands_on_original_device(monkeypatch):
+    device = torch.device("cuda", 0)
+    gptq = _make_quantize_final_move_gptq(device)
+    calls = _patch_final_move_to_oom(monkeypatch, device, fail_times=1)
+
+    log_messages = []
+    monkeypatch.setattr(
+        gptq_mod.log,
+        "warn",
+        lambda message, *args, **kwargs: log_messages.append(message % args if args else message),
+    )
+
+    qweight, *_ = gptq.quantize(blocksize=4)
+
+    assert calls["count"] == 1
+    # The caller assigns this straight into module.weight.data, so a CPU
+    # tensor here (rather than a retry) would corrupt a GPU-resident module.
+    assert qweight.device == device
+    joined_logs = "\n".join(log_messages)
+    assert "retrying the same device" in joined_logs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CPU fallback regression coverage")
+def test_gptq_quantize_final_result_move_raises_when_retry_also_ooms(monkeypatch):
+    device = torch.device("cuda", 0)
+    gptq = _make_quantize_final_move_gptq(device)
+    _patch_final_move_to_oom(monkeypatch, device, fail_times=2)
+
+    monkeypatch.setattr(gptq_mod.log, "warn", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        gptq.quantize(blocksize=4)
 
 
 def test_gptq_act_group_aware_accepts_effective_columns_with_tail_group():
@@ -249,6 +523,85 @@ def test_embedding_group_aware_ordering_preserves_tail_group():
     assert scale.shape == zero.shape == (3, 3)
     torch.testing.assert_close(g_idx, torch.tensor([0, 0, 1, 1, 2], dtype=torch.int32))
     assert torch.isfinite(quantized).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CPU fallback regression coverage")
+def test_gptq_embedding_weight_clone_oom_falls_back_to_cpu(monkeypatch):
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+
+    embedding = nn.Embedding(6, 3, dtype=torch.float32).to(device).eval()
+    gptq = GPTQ(embedding, qcfg=QuantizeConfig(bits=4, group_size=2, sym=True))
+    gptq.quantizer.configure(perchannel=True)
+    gptq.add_batch(torch.randint(0, 6, (1, 4), device=device), None)
+
+    original_clone = GPTQ.clone_module
+    calls = []
+
+    def _patched_clone(self, copy=True, device=None):
+        resolved = torch.device(device) if device is not None else self.module.weight.data.device
+        calls.append(resolved)
+        if resolved.type == "cuda":
+            raise RuntimeError("CUDA out of memory. simulated for regression test")
+        return original_clone(self, copy=copy, device=device)
+
+    monkeypatch.setattr(GPTQ, "clone_module", _patched_clone)
+
+    log_messages = []
+    monkeypatch.setattr(
+        gptq_mod.log,
+        "warn",
+        lambda message, *args, **kwargs: log_messages.append(message % args if args else message),
+    )
+
+    quantized, *_ = gptq.quantize(blocksize=4)
+
+    assert calls[0].type == "cuda"
+    assert calls[1] == torch.device("cpu")
+    # The final result move retries back onto the module's own device, so a
+    # CPU-fallback weight clone earlier in the pipeline must not leak into
+    # the returned tensor.
+    assert quantized.device == device
+    joined_logs = "\n".join(log_messages)
+    assert "falling back to CPU" in joined_logs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CPU fallback regression coverage")
+def test_gptq_embedding_quantize_result_move_retries_and_lands_on_original_device(monkeypatch):
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    torch.manual_seed(0)
+
+    embedding = nn.Embedding(6, 3, dtype=torch.float32).to(device).eval()
+    gptq = GPTQ(embedding, qcfg=QuantizeConfig(bits=4, group_size=2, sym=True))
+    gptq.quantizer.configure(perchannel=True)
+    gptq.add_batch(torch.randint(0, 6, (1, 4), device=device), None)
+
+    original_to = torch.Tensor.to
+    state = {"failed": False}
+
+    def _patched_to(self, *args, **kwargs):
+        if not state["failed"] and "non_blocking" in kwargs and kwargs.get("device") == device:
+            state["failed"] = True
+            raise RuntimeError("CUDA out of memory. simulated for regression test")
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", _patched_to)
+
+    log_messages = []
+    monkeypatch.setattr(
+        gptq_mod.log,
+        "warn",
+        lambda message, *args, **kwargs: log_messages.append(message % args if args else message),
+    )
+
+    quantized, *_ = gptq.quantize(blocksize=4)
+
+    assert state["failed"]
+    assert quantized.device == device
+    joined_logs = "\n".join(log_messages)
+    assert "retrying the same device" in joined_logs
 
 
 def test_embedding_capture_applies_rank_two_attention_mask():

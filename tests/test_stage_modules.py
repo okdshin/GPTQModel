@@ -3,6 +3,7 @@ import threading
 import types
 from typing import Dict
 
+import pytest
 import torch
 
 import gptqmodel.looper.stage_subset as stage_subset_module
@@ -26,6 +27,7 @@ from gptqmodel.looper.stage_layer import (
 from gptqmodel.looper.stage_subset import CalibrationCoveragePolicy, SubsetPlan, SubsetStageResult
 from gptqmodel.models.base import BaseQModel
 from gptqmodel.quantization.config import QuantizeConfig
+from gptqmodel.utils.looper_helpers import forward_batch_worker
 
 
 class _DummyQModel:
@@ -226,6 +228,21 @@ class _TinyLooper:
 
 class _TinyExecutorLayer(torch.nn.Module):
     def forward(self, hidden_states, **kwargs):
+        return hidden_states
+
+
+class _FlakyExecutorLayer(torch.nn.Module):
+    """Raises a CUDA-OOM-shaped RuntimeError on its first `fail_times` calls."""
+
+    def __init__(self, fail_times=1):
+        super().__init__()
+        self.calls = 0
+        self.fail_times = fail_times
+
+    def forward(self, hidden_states, **kwargs):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError("CUDA out of memory. simulated for regression test")
         return hidden_states
 
 
@@ -572,6 +589,118 @@ def test_stage_inputs_capture_collects_real_inputs():
     assert torch.equal(cache.layer_input_kwargs[0]["extra"], extra.unsqueeze(0))
     assert gptq_model._hook_started is True
     assert gptq_model._hook_finished is True
+
+
+def _run_executor_single_flaky(executor, processor, layer, cur_layer_device):
+    return executor.run_single(
+        module=layer,
+        processor=processor,
+        layer_inputs=[[torch.zeros(1, 1, 1)]],
+        layer_input_kwargs=[{}],
+        position_ids=[],
+        attention_masks=[None],
+        cur_layer_device=cur_layer_device,
+        is_lm_head_module=False,
+        shared_kv_cache_dict={},
+        layer_index=0,
+        need_outputs=True,
+        reuse_kv=False,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA runtime to exercise a real accelerator device")
+def test_forward_executor_run_single_retries_once_after_oom():
+    looper = _make_forward_executor_looper()
+    executor = ForwardExecutor(looper)
+    processor = _DummyForwardProcessor()
+    layer = _FlakyExecutorLayer(fail_times=1)
+
+    outputs = _run_executor_single_flaky(executor, processor, layer, torch.device("cuda", 0))
+
+    assert layer.calls == 2
+    assert len(outputs) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA runtime to exercise a real accelerator device")
+def test_forward_executor_run_single_reraises_after_second_oom():
+    looper = _make_forward_executor_looper()
+    executor = ForwardExecutor(looper)
+    processor = _DummyForwardProcessor()
+    layer = _FlakyExecutorLayer(fail_times=2)
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        _run_executor_single_flaky(executor, processor, layer, torch.device("cuda", 0))
+
+    assert layer.calls == 2
+
+
+def test_forward_executor_run_single_does_not_retry_oom_shaped_error_on_cpu():
+    """is_accelerator_oom_error is scoped to exec_device: a CPU-side RuntimeError
+    that happens to say "out of memory" must not be treated as a GPU OOM and
+    retried -- CPU has no allocator cache to flush, and the error is real.
+    """
+    looper = _make_forward_executor_looper()
+    executor = ForwardExecutor(looper)
+    processor = _DummyForwardProcessor()
+    layer = _FlakyExecutorLayer(fail_times=1)
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        _run_executor_single_flaky(executor, processor, layer, torch.device("cpu"))
+
+    assert layer.calls == 1
+
+
+def _run_forward_batch_worker_flaky(layer, module_device):
+    if module_device is not None:
+        layer._gptqmodule_device_hint = module_device
+    return forward_batch_worker(
+        module=layer,
+        processor=_DummyForwardProcessor(),
+        batch_index=0,
+        layer_input=[torch.zeros(1, 1, 1)],
+        layer_input_kwargs={},
+        attention_mask=None,
+        position_ids=None,
+        support_batch_quantize=False,
+        is_lm_head_module=False,
+        need_output=True,
+        reuse_kv=False,
+        prev_kv=None,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA runtime to exercise a real accelerator device")
+def test_forward_batch_worker_retries_once_after_oom():
+    """run_parallel's per-device worker must get the same OOM retry as
+    run_single -- otherwise auto_forward_data_parallel with multiple GPUs
+    aborts the whole run on a transient OOM instead of recovering.
+    """
+    layer = _FlakyExecutorLayer(fail_times=1)
+
+    batch_index, output, _kv_next = _run_forward_batch_worker_flaky(layer, torch.device("cuda", 0))
+
+    assert layer.calls == 2
+    assert batch_index == 0
+    assert output is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA runtime to exercise a real accelerator device")
+def test_forward_batch_worker_reraises_after_second_oom():
+    layer = _FlakyExecutorLayer(fail_times=2)
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        _run_forward_batch_worker_flaky(layer, torch.device("cuda", 0))
+
+    assert layer.calls == 2
+
+
+def test_forward_batch_worker_does_not_retry_oom_shaped_error_on_cpu():
+    layer = _FlakyExecutorLayer(fail_times=1)
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        _run_forward_batch_worker_flaky(layer, None)
+
+    assert layer.calls == 1
 
 
 def test_forward_executor_run_single_can_skip_moe_routing_override_for_replay():
