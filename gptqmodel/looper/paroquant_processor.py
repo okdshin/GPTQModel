@@ -383,6 +383,14 @@ class ParoQuantProcessor(LoopProcessor):
                 }
                 return
             entry.setdefault("inputs", [])
+            # Retry-dedupe is scoped to a single forward pass (this call marks the
+            # start of a new one, e.g. a later subset revisiting the same module
+            # within this layer). Captured `inputs` intentionally persist across
+            # subsets -- only the dedupe set must not survive into the new pass,
+            # or a legitimate batch_index reused by the new pass (numbering
+            # restarts at 0 per subset) would be silently skipped as a duplicate
+            # of the previous pass's same-numbered batch forever.
+            entry.pop("seen_batch_indices", None)
 
     def _layer_input_features(self, state: _ParoQuantLayerState) -> Dict[str, torch.Tensor]:
         """Materialize concatenated calibration features for all modules in a layer."""
